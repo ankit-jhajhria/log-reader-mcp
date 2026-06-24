@@ -4,6 +4,29 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Check Python 3 is available
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: python3 not found. Install Python 3.8+ and try again."
+    exit 1
+fi
+
+PYTHON_VERSION=$(python3 -c "import sys; print(sys.version_info.minor)")
+if [ "$PYTHON_VERSION" -lt 8 ]; then
+    echo "ERROR: Python 3.8+ required. Found: $(python3 --version)"
+    exit 1
+fi
+
+# Check venv is available (missing on Ubuntu/Debian without python3-venv)
+if ! python3 -m venv --help &>/dev/null; then
+    echo "ERROR: python3-venv is not installed."
+    echo ""
+    echo "Fix it with:"
+    echo "  Ubuntu/Debian: sudo apt install python3-venv"
+    echo "  Fedora/RHEL:   sudo dnf install python3"
+    echo "  macOS:         venv is included with Python from python.org or Homebrew"
+    exit 1
+fi
+
 echo "Creating virtualenv..."
 python3 -m venv "$SCRIPT_DIR/venv"
 
@@ -16,7 +39,6 @@ SETTINGS="$HOME/.claude/settings.json"
 
 echo "Registering MCP server in $SETTINGS ..."
 
-# Use Python to safely merge the mcpServers entry into existing settings.json
 python3 - <<EOF
 import json, os
 
@@ -38,5 +60,8 @@ with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 
-print("Done. Restart Claude Code to load the MCP.")
+print("Registered successfully.")
 EOF
+
+echo ""
+echo "Done! Restart Claude Code to load the MCP server."

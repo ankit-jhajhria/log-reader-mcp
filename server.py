@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only MCP server for monitoring terminal/application logs across any project."""
+"""MCP server for monitoring terminal/application logs across any project."""
 
 import json
 import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 import datetime
 from pathlib import Path
@@ -13,9 +14,17 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("log-reader")
 
-# Tracks background processes started via run_and_capture
-_PROCS_FILE = "/tmp/mcp-log-reader-procs.json"
+_TMP = tempfile.gettempdir()
+_PROCS_FILE = os.path.join(_TMP, "mcp-log-reader-procs.json")
 
+ERROR_PATTERNS = re.compile(
+    r"error|exception|traceback|critical|fatal|fail|panic|segfault|killed|oom",
+    re.IGNORECASE,
+)
+WARNING_PATTERNS = re.compile(r"warning|warn|deprecated", re.IGNORECASE)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _load_procs() -> dict:
     try:
@@ -30,8 +39,16 @@ def _save_procs(procs: dict) -> None:
         json.dump(procs, f, indent=2)
 
 
+def _is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _tail_lines(path: str, n: int) -> list[str]:
-    """Efficiently read last N lines without loading the whole file into memory."""
+    """Efficiently read last N lines without loading the whole file."""
     with open(path, "rb") as f:
         f.seek(0, 2)
         size = f.tell()
@@ -44,59 +61,92 @@ def _tail_lines(path: str, n: int) -> list[str]:
             pos -= step
             f.seek(pos)
             buf = f.read(step) + buf
-        lines = buf.decode("utf-8", errors="replace").splitlines()
-        return lines[-n:]
+        return buf.decode("utf-8", errors="replace").splitlines()[-n:]
+
+
+def _safe_open(path: Path, mode: str = "r"):
+    """Open a file with a clean error for permission issues."""
+    try:
+        return open(str(path), mode, errors="replace")
+    except PermissionError:
+        raise PermissionError(f"Permission denied reading {path}. Try running Claude Code with elevated permissions.")
 
 
 # ── Process capture tools ────────────────────────────────────────────────────
 
 @mcp.tool()
-def run_and_capture(command: str, log_file: str = "") -> str:
+def run_and_capture(command: str, cwd: str = "", log_file: str = "") -> str:
     """
     Run any shell command in the background and capture its stdout+stderr to a log file.
-    Use this for projects that don't write log files — just run their server through this.
+    Use for projects that don't write log files — just run their server through this.
 
     Args:
-        command:  Shell command to run (e.g. "python manage.py runserver", "node server.js", "npm start", "./mybinary")
-        log_file: Where to write output. If empty, auto-creates a file in /tmp based on command name.
+        command:  Shell command (e.g. "python manage.py runserver", "node server.js", "npm start")
+        cwd:      Working directory to run the command from. Defaults to the current directory.
+                  Always set this when the project is in a specific folder.
+        log_file: Where to write output. Auto-generated in temp dir if not specified.
     """
+    work_dir = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    if not work_dir.exists():
+        return f"ERROR: working directory not found: {work_dir}"
+
     if not log_file:
-        cmd_name = command.split()[0].replace("/", "_").replace(".", "_")
+        cmd_name = re.sub(r"[^\w]", "_", command.split()[0])[:20]
         ts = int(time.time())
-        log_file = f"/tmp/mcp-{cmd_name}-{ts}.log"
+        log_file = os.path.join(_TMP, f"mcp-{cmd_name}-{ts}.log")
 
     log_path = Path(log_file).expanduser().resolve()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(str(log_path), "w") as f:
-        proc = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,  # detach so it survives MCP restarts
+    try:
+        with open(str(log_path), "w") as f:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                cwd=str(work_dir),
+                start_new_session=True,
+            )
+    except Exception as e:
+        return f"ERROR: failed to start process: {e}"
+
+    # Health check — wait briefly to catch instant failures (wrong command, port conflict, etc.)
+    time.sleep(1.5)
+    if not _is_alive(proc.pid):
+        try:
+            output = log_path.read_text(errors="replace").strip()
+        except OSError:
+            output = "(no output captured)"
+        return (
+            f"FAILED: process exited immediately.\n"
+            f"Command: {command}\n"
+            f"Working dir: {work_dir}\n\n"
+            f"Output:\n{output or '(empty)'}"
         )
 
     procs = _load_procs()
     procs[str(proc.pid)] = {
         "command": command,
+        "cwd": str(work_dir),
         "log_file": str(log_path),
         "started": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     _save_procs(procs)
 
     return (
-        f"Started:  {command}\n"
-        f"PID:      {proc.pid}\n"
-        f"Log file: {log_path}\n\n"
-        f"Read output:  tail_file('{log_path}')\n"
-        f"Stop server:  stop_process({proc.pid})"
+        f"Started:     {command}\n"
+        f"Working dir: {work_dir}\n"
+        f"PID:         {proc.pid}\n"
+        f"Log file:    {log_path}\n\n"
+        f"Read output: tail_file('{log_path}')\n"
+        f"Stop server: stop_process({proc.pid})"
     )
 
 
 @mcp.tool()
 def list_captured_processes() -> str:
-    """List all background processes started via run_and_capture, with their status and log file path."""
+    """List all background processes started via run_and_capture, with status and log paths."""
     procs = _load_procs()
     if not procs:
         return "No captured processes recorded."
@@ -105,15 +155,14 @@ def list_captured_processes() -> str:
     dead = []
     for pid_str, info in procs.items():
         pid = int(pid_str)
-        try:
-            os.kill(pid, 0)
-            status = "RUNNING"
-        except ProcessLookupError:
-            status = "stopped"
+        alive = _is_alive(pid)
+        status = "RUNNING" if alive else "stopped"
+        if not alive:
             dead.append(pid_str)
         lines.append(
             f"PID {pid:>6}  [{status}]\n"
             f"  command: {info['command']}\n"
+            f"  cwd:     {info.get('cwd', '?')}\n"
             f"  started: {info['started']}\n"
             f"  log:     {info['log_file']}"
         )
@@ -132,16 +181,15 @@ def stop_process(pid: int) -> str:
     Stop a background process started via run_and_capture.
 
     Args:
-        pid: Process ID shown by run_and_capture or list_captured_processes
+        pid: Process ID from run_and_capture or list_captured_processes
     """
     try:
         os.kill(pid, signal.SIGTERM)
         time.sleep(0.5)
-        try:
-            os.kill(pid, 0)
+        if _is_alive(pid):
             os.kill(pid, signal.SIGKILL)
             result = f"PID {pid} force-killed (SIGKILL)"
-        except ProcessLookupError:
+        else:
             result = f"PID {pid} stopped cleanly (SIGTERM)"
     except ProcessLookupError:
         result = f"PID {pid} was not running"
@@ -150,6 +198,42 @@ def stop_process(pid: int) -> str:
     procs.pop(str(pid), None)
     _save_procs(procs)
     return result
+
+
+@mcp.tool()
+def restart_process(pid: int) -> str:
+    """
+    Stop a running process and restart it with the same command and working directory.
+    Useful after a code change.
+
+    Args:
+        pid: Process ID from list_captured_processes
+    """
+    procs = _load_procs()
+    info = procs.get(str(pid))
+    if not info:
+        return f"ERROR: PID {pid} not found in captured processes. Use list_captured_processes() to check."
+
+    command = info["command"]
+    cwd = info.get("cwd", "")
+    log_file = info["log_file"]
+
+    # Stop old process
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.5)
+        if _is_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+    procs.pop(str(pid), None)
+    _save_procs(procs)
+
+    # Small gap so ports are released
+    time.sleep(1)
+
+    return run_and_capture(command=command, cwd=cwd, log_file=log_file)
 
 
 # ── File reading tools ───────────────────────────────────────────────────────
@@ -168,7 +252,10 @@ def tail_file(path: str, lines: int = 80) -> str:
         return f"ERROR: file not found: {p}"
     if not p.is_file():
         return f"ERROR: not a file: {p}"
-    result = _tail_lines(str(p), lines)
+    try:
+        result = _tail_lines(str(p), lines)
+    except PermissionError:
+        return f"ERROR: permission denied reading {p}"
     header = f"=== {p} — last {len(result)} lines ===\n"
     numbered = "\n".join(f"{i + 1:>6}: {ln}" for i, ln in enumerate(result))
     return header + numbered
@@ -186,31 +273,33 @@ def get_new_lines(path: str, after_line: int = 0) -> str:
 
     Args:
         path:       Path to the log file
-        after_line: Return only lines after this line number (0 = return all)
+        after_line: Return only lines after this number (0 = return all)
     """
     p = Path(path).expanduser().resolve()
     if not p.exists():
         return f"ERROR: file not found: {p}"
-    new_lines = []
-    with open(str(p), "r", errors="replace") as f:
-        for lineno, line in enumerate(f, 1):
-            if lineno > after_line:
-                new_lines.append(f"{lineno:>6}: {line.rstrip()}")
+    try:
+        new_lines = []
+        with _safe_open(p) as f:
+            for lineno, line in enumerate(f, 1):
+                if lineno > after_line:
+                    new_lines.append(f"{lineno:>6}: {line.rstrip()}")
+    except PermissionError as e:
+        return f"ERROR: {e}"
     total = after_line + len(new_lines)
     header = f"=== {p} — lines {after_line + 1}–{total} (total so far: {total}) ===\n"
-    if not new_lines:
-        return header + "(no new lines)"
-    return header + "\n".join(new_lines)
+    return header + ("\n".join(new_lines) if new_lines else "(no new lines)")
 
 
 @mcp.tool()
-def search_log(path: str, pattern: str, max_matches: int = 50, case_sensitive: bool = False) -> str:
+def search_log(path: str, pattern: str, context_lines: int = 0, max_matches: int = 50, case_sensitive: bool = False) -> str:
     """
     Search a log file for lines matching a regex or plain string.
 
     Args:
         path:          File to search
         pattern:       Regex or plain string (e.g. "ERROR", "500", "Traceback")
+        context_lines: Lines to show before and after each match, like grep -C (default 0)
         max_matches:   Cap on results (default 50)
         case_sensitive: Default False
     """
@@ -222,23 +311,100 @@ def search_log(path: str, pattern: str, max_matches: int = 50, case_sensitive: b
         regex = re.compile(pattern, flags)
     except re.error as e:
         return f"ERROR: invalid regex '{pattern}': {e}"
-    matches = []
-    with open(str(p), "r", errors="replace") as f:
-        for lineno, line in enumerate(f, 1):
-            if regex.search(line):
-                matches.append(f"{lineno:>6}: {line.rstrip()}")
-                if len(matches) >= max_matches:
-                    matches.append(f"... capped at {max_matches} matches, refine your pattern to see more")
-                    break
-    if not matches:
+
+    try:
+        with _safe_open(p) as f:
+            all_lines = f.readlines()
+    except PermissionError as e:
+        return f"ERROR: {e}"
+
+    match_indices = [i for i, ln in enumerate(all_lines) if regex.search(ln)]
+    if not match_indices:
         return f"No matches for '{pattern}' in {p}"
-    return f"=== {len(matches)} matches for '{pattern}' in {p} ===\n" + "\n".join(matches)
+
+    capped = len(match_indices) > max_matches
+    match_indices = match_indices[:max_matches]
+
+    # Collect line ranges to display (with context), merging overlapping windows
+    ranges = []
+    for i in match_indices:
+        start = max(0, i - context_lines)
+        end = min(len(all_lines) - 1, i + context_lines)
+        if ranges and start <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], end)
+        else:
+            ranges.append((start, end))
+
+    blocks = []
+    for start, end in ranges:
+        block = []
+        for i in range(start, end + 1):
+            lineno = i + 1
+            marker = ">>>" if regex.search(all_lines[i]) else "   "
+            block.append(f"{marker} {lineno:>6}: {all_lines[i].rstrip()}")
+        blocks.append("\n".join(block))
+
+    header = f"=== {len(match_indices)} match(es) for '{pattern}' in {p}"
+    if capped:
+        header += f" (capped at {max_matches})"
+    header += " ===\n"
+    return header + "\n\n".join(blocks)
+
+
+@mcp.tool()
+def detect_errors(path: str, last_lines: int = 0) -> str:
+    """
+    Scan a log file for errors, exceptions, warnings, and crashes.
+    The fastest way to check if something went wrong.
+
+    Args:
+        path:       File to scan
+        last_lines: Only scan the last N lines (0 = scan entire file)
+    """
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        return f"ERROR: file not found: {p}"
+    try:
+        if last_lines:
+            lines = _tail_lines(str(p), last_lines)
+            offset = 0
+        else:
+            with _safe_open(p) as f:
+                lines = [ln.rstrip() for ln in f]
+            offset = 0
+    except PermissionError as e:
+        return f"ERROR: {e}"
+
+    errors = []
+    warnings = []
+    for i, line in enumerate(lines):
+        lineno = i + 1 + offset
+        if ERROR_PATTERNS.search(line):
+            errors.append(f"  {lineno:>6}: {line}")
+        elif WARNING_PATTERNS.search(line):
+            warnings.append(f"  {lineno:>6}: {line}")
+
+    if not errors and not warnings:
+        scope = f"last {last_lines} lines of " if last_lines else ""
+        return f"No errors or warnings found in {scope}{p}"
+
+    parts = []
+    if errors:
+        parts.append(f"ERRORS / EXCEPTIONS ({len(errors)} found):\n" + "\n".join(errors[:30]))
+        if len(errors) > 30:
+            parts[0] += f"\n  ... and {len(errors) - 30} more"
+    if warnings:
+        parts.append(f"WARNINGS ({len(warnings)} found):\n" + "\n".join(warnings[:20]))
+        if len(warnings) > 20:
+            parts[-1] += f"\n  ... and {len(warnings) - 20} more"
+
+    return f"=== {p} ===\n\n" + "\n\n".join(parts)
 
 
 @mcp.tool()
 def list_log_files(directory: str, pattern: str = "*.log") -> str:
     """
-    List log files in a directory. Works with any project's log folder.
+    List log files in a directory.
 
     Args:
         directory: Directory to scan
@@ -249,15 +415,21 @@ def list_log_files(directory: str, pattern: str = "*.log") -> str:
         return f"ERROR: directory not found: {d}"
     if not d.is_dir():
         return f"ERROR: not a directory: {d}"
-    matches = sorted(d.glob(pattern))
+    try:
+        matches = sorted(d.glob(pattern))
+    except PermissionError:
+        return f"ERROR: permission denied listing {d}"
     if not matches:
         return f"No files matching '{pattern}' in {d}"
+    now = time.time()
     rows = []
     for m in matches:
         try:
             stat = m.stat()
             mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-            rows.append(f"{stat.st_size / 1024:>10.1f} KB  {mtime}  {m}")
+            age_s = now - stat.st_mtime
+            active = " [active]" if age_s < 60 else ""
+            rows.append(f"{stat.st_size / 1024:>10.1f} KB  {mtime}{active}  {m}")
         except OSError:
             rows.append(f"{'?':>13}  {'?':>16}  {m}")
     return f"=== {len(matches)} file(s) in {d} ===\n" + "\n".join(rows)
@@ -275,15 +447,25 @@ def file_info(path: str) -> str:
     p = Path(path).expanduser().resolve()
     if not p.exists():
         return f"ERROR: not found: {p}"
-    stat = p.stat()
+    try:
+        stat = p.stat()
+    except PermissionError:
+        return f"ERROR: permission denied: {p}"
     mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-    with open(str(p), "rb") as f:
-        line_count = sum(1 for _ in f)
+    try:
+        with open(str(p), "rb") as f:
+            line_count = sum(1 for _ in f)
+    except PermissionError:
+        line_count = "?"
     return (
         f"path:     {p}\n"
         f"size:     {stat.st_size:,} bytes ({stat.st_size / 1024:.1f} KB)\n"
         f"modified: {mtime}\n"
-        f"lines:    {line_count:,}"
+        f"lines:    {line_count:,}" if isinstance(line_count, int) else
+        f"path:     {p}\n"
+        f"size:     {stat.st_size:,} bytes ({stat.st_size / 1024:.1f} KB)\n"
+        f"modified: {mtime}\n"
+        f"lines:    {line_count}"
     )
 
 
