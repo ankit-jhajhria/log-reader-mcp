@@ -26,7 +26,28 @@ Restart Claude Code after install.
 
 ## How to use in a new session
 
-### Project with no log files (Node, Go, Rust, plain Python, etc.)
+### Project with no log files — Option A: tmux (you see it running)
+
+Start your terminal inside tmux once:
+```bash
+tmux new -s myserver
+```
+
+Then tell Claude:
+```
+run "docker compose up --build" in my tmux session "myserver"
+```
+
+Claude sends the command to your terminal — you watch it run. To stop:
+```
+stop docker in tmux session "myserver"
+```
+
+Claude sends `Ctrl+C` to the pane. You see it stop in real time.
+
+---
+
+### Project with no log files — Option B: background (hidden, no terminal needed)
 
 Open Claude Code in your project and say:
 
@@ -89,7 +110,16 @@ Files modified in the last 60 seconds are marked `[active]` so you can spot the 
 
 ## All tools
 
-### Process management
+### tmux — direct terminal control (no log files needed)
+| Tool | What it does |
+|---|---|
+| `tmux_sessions()` | List all running tmux sessions and panes |
+| `tmux_new_session(session, command, cwd)` | Create a new tmux session, optionally run a command in it |
+| `tmux_run(session, command, pane, wait)` | Send a command to a tmux pane — runs visibly in your terminal |
+| `tmux_read(session, pane, lines)` | Read output directly from a tmux pane — no log file needed |
+| `tmux_send_keys(session, keys)` | Send raw keys like Ctrl+C, Ctrl+D, Enter to stop/control processes |
+
+### Process management (background — no visible terminal)
 | Tool | What it does |
 |---|---|
 | `run_and_capture(command, cwd, log_file)` | Start any server in background, capture all output to a file |

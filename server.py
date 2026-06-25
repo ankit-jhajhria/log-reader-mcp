@@ -236,6 +236,160 @@ def restart_process(pid: int) -> str:
     return run_and_capture(command=command, cwd=cwd, log_file=log_file)
 
 
+# ── tmux tools ──────────────────────────────────────────────────────────────
+
+def _tmux_check() -> str | None:
+    """Return error string if tmux is not available, else None."""
+    if subprocess.run(["which", "tmux"], capture_output=True).returncode != 0:
+        return "ERROR: tmux is not installed. Run: sudo apt install tmux (Ubuntu) or brew install tmux (macOS)"
+    return None
+
+
+def _tmux_target(session: str, pane: int) -> str:
+    return f"{session}:{pane}"
+
+
+@mcp.tool()
+def tmux_sessions() -> str:
+    """
+    List all running tmux sessions and their panes.
+    Run this first to find the session name to use in other tmux tools.
+    """
+    err = _tmux_check()
+    if err:
+        return err
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F",
+         "#{session_name}:#{window_index}.#{pane_index}  [#{pane_width}x#{pane_height}]  cmd=#{pane_current_command}  path=#{pane_current_path}"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return "No tmux sessions running. Start one with: tmux new -s mysession"
+    return "=== Running tmux panes ===\n" + result.stdout.strip()
+
+
+@mcp.tool()
+def tmux_read(session: str, pane: int = 0, lines: int = 80) -> str:
+    """
+    Read output directly from a tmux pane — no log file needed.
+    This sees exactly what is printed in your terminal.
+
+    Args:
+        session: tmux session name (get it from tmux_sessions())
+        pane:    pane index (default 0 — the first/only pane)
+        lines:   how many lines of scrollback to capture (default 80)
+    """
+    err = _tmux_check()
+    if err:
+        return err
+    target = _tmux_target(session, pane)
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return f"ERROR: pane '{target}' not found. Use tmux_sessions() to list available panes."
+    output = result.stdout.rstrip()
+    if not output:
+        return f"Pane '{target}' is empty or has no output yet."
+    return f"=== tmux {target} — last {lines} lines ===\n{output}"
+
+
+@mcp.tool()
+def tmux_run(session: str, command: str, pane: int = 0, wait: float = 1.5) -> str:
+    """
+    Send a command to a tmux pane and read back the output.
+    The command runs visibly in your terminal — you can watch it execute.
+
+    Args:
+        session: tmux session name
+        command: shell command to run (e.g. "docker compose up --build", "git status")
+        pane:    pane index (default 0)
+        wait:    seconds to wait before reading output (default 1.5 — increase for slow commands)
+    """
+    err = _tmux_check()
+    if err:
+        return err
+    target = _tmux_target(session, pane)
+    send = subprocess.run(
+        ["tmux", "send-keys", "-t", target, command, "Enter"],
+        capture_output=True, text=True
+    )
+    if send.returncode != 0:
+        return f"ERROR: could not send to pane '{target}'. Use tmux_sessions() to check available panes."
+    if wait > 0:
+        time.sleep(wait)
+    return tmux_read(session=session, pane=pane, lines=80)
+
+
+@mcp.tool()
+def tmux_send_keys(session: str, keys: str, pane: int = 0) -> str:
+    """
+    Send raw keys to a tmux pane. Use this for special keys like Ctrl+C, Ctrl+D, Enter, arrow keys.
+
+    Common values:
+      "C-c"     → Ctrl+C  (stop a running process)
+      "C-d"     → Ctrl+D  (exit a shell/REPL)
+      "q"       → quit (e.g. for less/vim)
+      "Enter"   → press Enter
+      "Up"      → arrow up (previous command)
+
+    Args:
+        session: tmux session name
+        keys:    key sequence to send
+        pane:    pane index (default 0)
+    """
+    err = _tmux_check()
+    if err:
+        return err
+    target = _tmux_target(session, pane)
+    result = subprocess.run(
+        ["tmux", "send-keys", "-t", target, keys, ""],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return f"ERROR: could not send keys to '{target}'. Use tmux_sessions() to check available panes."
+    time.sleep(0.3)
+    return tmux_read(session=session, pane=pane, lines=30)
+
+
+@mcp.tool()
+def tmux_new_session(session: str, command: str = "", cwd: str = "") -> str:
+    """
+    Create a new tmux session (optionally run a command in it immediately).
+    After this you can watch the terminal and Claude can read it via tmux_read.
+
+    Args:
+        session: name for the new session (e.g. "myserver", "docker")
+        command: command to run immediately inside the session (optional)
+        cwd:     working directory for the session (optional)
+    """
+    err = _tmux_check()
+    if err:
+        return err
+
+    cmd = ["tmux", "new-session", "-d", "-s", session]
+    if cwd:
+        work_dir = str(Path(cwd).expanduser().resolve())
+        cmd += ["-c", work_dir]
+    if command:
+        cmd += [command]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "duplicate session" in stderr:
+            return f"ERROR: session '{session}' already exists. Use tmux_sessions() to see running sessions."
+        return f"ERROR: {stderr}"
+
+    msg = f"Session '{session}' created."
+    if command:
+        time.sleep(1.5)
+        output = tmux_read(session=session, pane=0, lines=50)
+        return f"{msg}\n\n{output}"
+    return f"{msg}\nAttach to see it: tmux attach -t {session}\nOr use tmux_run('{session}', 'your command') to run commands in it."
+
+
 # ── File reading tools ───────────────────────────────────────────────────────
 
 @mcp.tool()
